@@ -5,7 +5,6 @@ cd /d "%~dp0"
 
 REM ── Existing instance detection ───────────────────────────
 set "PORT=7860"
-set "FALLBACK_PORT=7861"
 set "FORCE_RESTART=0"
 
 if /I "%~1"=="--force-restart" set "FORCE_RESTART=1"
@@ -20,61 +19,44 @@ if not "%~1"=="" (
     )
 )
 
-for /f "tokens=5" %%a in ('netstat -ano ^| findstr :7860') do set "RUNNING_7860=%%a"
-for /f "tokens=5" %%a in ('netstat -ano ^| findstr :7861') do set "RUNNING_7861=%%a"
-
-if "%FORCE_RESTART%"=="1" (
-    if defined RUNNING_7860 (
-        echo [INFO] --force-restart enabled. Stopping PID %RUNNING_7860% on 7860...
-        taskkill /PID %RUNNING_7860% /F >nul 2>nul
-    )
-    if defined RUNNING_7861 (
-        echo [INFO] --force-restart enabled. Stopping PID %RUNNING_7861% on 7861...
-        taskkill /PID %RUNNING_7861% /F >nul 2>nul
-    )
-    timeout /t 1 /nobreak >nul
-    set "RUNNING_7860="
-    set "RUNNING_7861="
-    for /f "tokens=5" %%a in ('netstat -ano ^| findstr :7860') do set "RUNNING_7860=%%a"
-    for /f "tokens=5" %%a in ('netstat -ano ^| findstr :7861') do set "RUNNING_7861=%%a"
-    if defined RUNNING_7860 (
-        echo [ERROR] Failed to stop existing PID %RUNNING_7860% on 7860.
-        exit /b 1
-    )
-    if defined RUNNING_7861 (
-        echo [ERROR] Failed to stop existing PID %RUNNING_7861% on 7861.
-        exit /b 1
-    )
-)
+call :get_listen_pid 7860 RUNNING_7860
+call :get_listen_pid 7861 RUNNING_7861
 
 if defined RUNNING_7860 (
-    echo [INFO] StoryWeaver appears to be already running on http://127.0.0.1:7860, PID %RUNNING_7860%.
-    echo [INFO] Reusing existing instance. No new process started.
-    exit /b 0
+    echo [INFO] Port 7860 is occupied by PID %RUNNING_7860%. Stopping it before restart...
+    taskkill /PID %RUNNING_7860% /F >nul 2>nul
 )
 
 if defined RUNNING_7861 (
-    echo [INFO] StoryWeaver appears to be already running on http://127.0.0.1:7861, PID %RUNNING_7861%.
-    echo [INFO] Reusing existing instance. No new process started.
-    exit /b 0
+    echo [INFO] Port 7861 is occupied by PID %RUNNING_7861%. Stopping it before restart...
+    taskkill /PID %RUNNING_7861% /F >nul 2>nul
 )
 
-for /f "tokens=5" %%a in ('netstat -ano ^| findstr :%PORT%') do set "OCCUPIED_PID=%%a"
-if defined OCCUPIED_PID (
-    echo [WARN] Port %PORT% is occupied by PID %OCCUPIED_PID%. Using fallback port %FALLBACK_PORT%.
-    set "PORT=%FALLBACK_PORT%"
+if defined RUNNING_7860 if "%FORCE_RESTART%"=="0" (
+    echo [INFO] Existing instance detected. Auto-restart mode is enabled by default.
 )
 
-for /f "tokens=5" %%a in ('netstat -ano ^| findstr :%PORT%') do set "FALLBACK_OCCUPIED_PID=%%a"
-if defined FALLBACK_OCCUPIED_PID (
-    echo [ERROR] Both 7860 and 7861 are occupied. Stop old instances and retry.
+timeout /t 1 /nobreak >nul
+
+set "RUNNING_7860="
+set "RUNNING_7861="
+call :get_listen_pid 7860 RUNNING_7860
+call :get_listen_pid 7861 RUNNING_7861
+
+if defined RUNNING_7860 (
+    echo [ERROR] Failed to stop PID %RUNNING_7860% on 7860.
+    exit /b 1
+)
+
+if defined RUNNING_7861 (
+    echo [ERROR] Failed to stop PID %RUNNING_7861% on 7861.
     exit /b 1
 )
 
 echo ==========================================
 echo StoryWeaver Bootstrap ^& Launch (Windows)
 echo ==========================================
-if "%FORCE_RESTART%"=="1" echo [INFO] Mode: force restart
+echo [INFO] Mode: always restart on occupied ports
 echo [INFO] Will launch on port: %PORT%
 echo.
 
@@ -132,6 +114,16 @@ if not exist ".env" (
 echo [6/6] Launching app on http://127.0.0.1:%PORT% ...
 "%PYTHON_CMD%" -m streamlit run app.py --server.port=%PORT% --server.headless=true
 goto :end
+
+:get_listen_pid
+setlocal
+set "PORT_TO_CHECK=%~1"
+set "FOUND_PID="
+for /f "tokens=5" %%a in ('netstat -ano -p tcp ^| findstr /R /C:":%PORT_TO_CHECK% .*LISTENING"') do (
+    if not "%%a"=="0" set "FOUND_PID=%%a"
+)
+endlocal & set "%~2=%FOUND_PID%"
+exit /b 0
 
 :venv_fail
 echo [ERROR] Failed to create virtual environment.
