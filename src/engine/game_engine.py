@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Dict, List, Optional
 
 from config import settings
@@ -20,6 +21,7 @@ from src.engine.state import GameState
 from src.nlu.intent_classifier import IntentClassifier
 from src.nlu.entity_extractor import EntityExtractor
 from src.nlu.coreference import CoreferenceResolver
+from src.nlu.sentiment_analyzer import SentimentAnalyzer
 from src.nlg.story_generator import StoryGenerator
 from src.nlg.option_generator import OptionGenerator, StoryOption
 from src.knowledge_graph.graph import KnowledgeGraph
@@ -79,11 +81,13 @@ class GameEngine:
         self.coref = CoreferenceResolver()
         self.intent_clf = IntentClassifier(model_path=intent_model_path)
         self.entity_ext = EntityExtractor()
+        self.sentiment = SentimentAnalyzer()
         self.nlu_status: Dict[str, object] = {
             "coref_loaded": False,
             "intent_model_loaded": False,
             "intent_backend": "rule_fallback",
             "entity_model_loaded": False,
+            "sentiment_loaded": False,
         }
 
         if auto_load_nlu:
@@ -141,7 +145,11 @@ class GameEngine:
         # 1. Coreference resolution
         recent_entries = self.state.story_history[-4:]
         recent_texts = [t["text"] for t in recent_entries]
-        resolved = self.coref.resolve(player_input, recent_texts)
+        known_entities = [
+            {"text": data.get("name", key), "type": data.get("entity_type", "unknown")}
+            for key, data in self.kg.graph.nodes(data=True)
+        ]
+        resolved = self.coref.resolve(player_input, recent_texts, known_entities=known_entities)
         logger.debug("[Engine][coref] Resolved: '%s' → '%s'", player_input[:40], resolved[:40])
 
         # 2. Intent classification
@@ -149,8 +157,13 @@ class GameEngine:
         intent = intent_result["intent"]
         logger.debug("[Engine][intent] intent=%s confidence=%.2f", intent, intent_result["confidence"])
 
+        # 2b. Sentiment analysis
+        emotion_result = self.sentiment.analyze(resolved)
+        logger.debug("[Engine][sentiment] emotion=%s confidence=%.2f", emotion_result["emotion"], emotion_result["confidence"])
+
         # 3. Entity extraction (NLU layer)
-        entities = self.entity_ext.extract(resolved)
+        kg_entity_names = list(self.kg.graph.nodes())
+        entities = self.entity_ext.extract(resolved, known_entities=kg_entity_names)
         entity_names = [e["text"] for e in entities]
         logger.debug("[Engine][nlu_entities] Extracted %d entities: %s", len(entities), entity_names)
 
@@ -165,6 +178,7 @@ class GameEngine:
             intent=intent,
             kg_summary=kg_summary,
             history=history,
+            emotion=emotion_result["emotion"],
         )
         self.state.add_narration(story_text)
         current_turn = self.state.turn_id
@@ -176,6 +190,7 @@ class GameEngine:
             player_input=resolved,
             nlu_entities=entities,
             turn_id=current_turn,
+            emotion=emotion_result["emotion"],
         )
 
         # 6. Conflict detection + resolution
@@ -202,16 +217,23 @@ class GameEngine:
             "intent": intent,
             "confidence": intent_result["confidence"],
             "entities": entities,
+            "emotion": emotion_result["emotion"],
+            "emotion_confidence": emotion_result["confidence"],
+            "emotion_scores": emotion_result.get("scores", {}),
             "intent_backend": self.nlu_status["intent_backend"],
             "intent_model_loaded": self.nlu_status["intent_model_loaded"],
             "coref_loaded": self.nlu_status["coref_loaded"],
             "entity_model_loaded": self.nlu_status["entity_model_loaded"],
+            "sentiment_loaded": self.nlu_status["sentiment_loaded"],
         }
 
         logger.info(
             "[Engine][process_turn] === Turn %d END === | KG: %d nodes, %d edges, %d conflicts",
             current_turn, self.kg.num_nodes, self.kg.num_edges, len(unresolved),
         )
+
+        # Auto-save
+        self._auto_save()
 
         return TurnResult(
             story_text=story_text,
@@ -268,6 +290,12 @@ class GameEngine:
         except Exception as exc:
             logger.warning("Entity extractor init failed: %s", exc)
 
+        try:
+            self.sentiment.load()
+            self.nlu_status["sentiment_loaded"] = self.sentiment.model is not None
+        except Exception as exc:
+            logger.warning("Sentiment analyzer init failed: %s", exc)
+
         logger.info(
             "NLU load status: coref_loaded=%s, intent_model_loaded=%s, intent_backend=%s, entity_model_loaded=%s",
             self.nlu_status["coref_loaded"],
@@ -282,6 +310,7 @@ class GameEngine:
         player_input: str = "",
         nlu_entities: Optional[List[Dict]] = None,
         turn_id: int = 0,
+        emotion: Optional[str] = None,
     ) -> None:
         """Apply KG updates based on configured extraction mode.
 
@@ -324,7 +353,7 @@ class GameEngine:
                 name = ent.get("text", "")
                 etype = ent.get("type", "thing")
                 if name:
-                    self.kg.add_entity(name, etype, turn_id=turn_id, is_player_mentioned=True)
+                    self.kg.add_entity(name, etype, turn_id=turn_id, is_player_mentioned=True, emotion=emotion)
                     nlu_names.append(name)
 
         # --- Step 3: Add extracted entities with rich attributes ---
@@ -378,3 +407,95 @@ class GameEngine:
             turn_id, len(extracted_names) + len(nlu_names), len(all_relations),
             self.kg.num_nodes, self.kg.num_edges,
         )
+
+    # ------------------------------------------------------------------
+    # Persistence
+    # ------------------------------------------------------------------
+
+    def save_game(self, filepath: Optional[str] = None) -> str:
+        """Save the current game state (KG + story history) to a JSON file.
+
+        Returns the filepath used.
+        """
+        import json
+        from pathlib import Path
+
+        if filepath is None:
+            save_dir = Path(settings.KG_SAVE_DIR)
+            save_dir.mkdir(parents=True, exist_ok=True)
+            filepath = str(save_dir / f"{self.genre}_latest.json")
+
+        path = Path(filepath)
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        game_data = {
+            "version": 1,
+            "genre": self.genre,
+            "state": {
+                "turn_id": self.state.turn_id,
+                "genre": self.state.genre,
+                "story_history": self.state.story_history,
+            },
+            "kg": self.kg.to_dict(),
+            "conflict_resolution": self.conflict_resolution,
+            "extraction_mode": self.extraction_mode,
+            "importance_mode": self.importance_mode,
+            "summary_mode": self.summary_mode,
+        }
+
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(game_data, f, indent=2, ensure_ascii=False)
+
+        logger.info("[Engine][save_game] Saved to %s | turn=%d", path, self.state.turn_id)
+        return str(path)
+
+    def load_game(self, filepath: str) -> None:
+        """Load a saved game state from a JSON file."""
+        import json
+        from pathlib import Path
+
+        path = Path(filepath)
+        if not path.exists():
+            logger.warning("[Engine][load_game] File not found: %s", path)
+            return
+
+        with open(path, "r", encoding="utf-8") as f:
+            game_data = json.load(f)
+
+        # Restore state
+        state_data = game_data.get("state", {})
+        self.state.turn_id = state_data.get("turn_id", 0)
+        self.state.genre = state_data.get("genre", self.genre)
+        self.state.story_history = state_data.get("story_history", [])
+
+        # Restore KG
+        kg_data = game_data.get("kg", {})
+        self.kg = KnowledgeGraph.from_dict(kg_data)
+        self.conflict_det = ConflictDetector(self.kg)
+        self.conflict_resolver = get_resolver(self.conflict_resolution)
+
+        # Restore strategies
+        self.conflict_resolution = game_data.get("conflict_resolution", self.conflict_resolution)
+        self.extraction_mode = game_data.get("extraction_mode", self.extraction_mode)
+
+        logger.info(
+            "[Engine][load_game] Loaded from %s | turn=%d | KG: %d nodes, %d edges",
+            path, self.state.turn_id, self.kg.num_nodes, self.kg.num_edges,
+        )
+
+    def _auto_save(self) -> None:
+        """Auto-save game state if enabled."""
+        if not settings.KG_AUTO_SAVE:
+            return
+        try:
+            save_dir = Path(settings.KG_SAVE_DIR)
+            save_dir.mkdir(parents=True, exist_ok=True)
+
+            # Save latest
+            self.save_game(str(save_dir / f"{self.genre}_latest.json"))
+
+            # Periodic snapshot
+            if self.state.turn_id % settings.KG_SNAPSHOT_INTERVAL == 0:
+                self.save_game(str(save_dir / f"{self.genre}_turn_{self.state.turn_id}.json"))
+        except Exception as exc:
+            logger.warning("[Engine][auto_save] Failed: %s", exc)

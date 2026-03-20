@@ -37,8 +37,9 @@ class StoryGenerator:
         intent: str,
         kg_summary: str,
         history: str,
+        emotion: str = "neutral",
     ) -> str:
-        """Continue the story based on the player's action."""
+        """Continue the story based on the player's action and emotion."""
         from src.utils.api_client import llm_client
 
         user_msg = STORY_CONTINUE_PROMPT.format(
@@ -46,6 +47,7 @@ class StoryGenerator:
             history=history,
             intent=intent,
             player_input=player_input,
+            emotion=emotion,
         )
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},

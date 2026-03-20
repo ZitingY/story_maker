@@ -28,6 +28,7 @@ class TestPromptTemplates:
             history="Turn 1 ...",
             intent="explore",
             player_input="go north",
+            emotion="neutral",
         )
         assert "hero: person" in rendered
         assert "go north" in rendered

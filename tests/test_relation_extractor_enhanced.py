@@ -109,17 +109,25 @@ class TestRelationExtractorEnhanced:
 
     @patch("src.utils.api_client.llm_client")
     def test_dual_extract_calls_both_prompts(self, mock_client):
-        mock_client.chat_json.side_effect = _mock_rich_extraction
+        # Single-call dual extraction returns combined result
+        mock_client.chat_json.return_value = {
+            "entities": [
+                {"name": "Hero", "type": "person", "description": "Brave", "status": {}, "state_changes": {}},
+                {"name": "Cave", "type": "location", "description": "Dark", "status": {}, "state_changes": {}},
+            ],
+            "relations": [],
+        }
         extractor = RelationExtractor(enhanced=True)
         result = extractor.extract_dual(
             player_input="I enter the cave",
-            story_text="The hero enters a dark cave. A sword glows on the ground.",
+            story_text="The hero enters a dark cave.",
             existing_entities=["Hero", "Forest"],
         )
         assert "entities" in result
         assert "relations" in result
-        # should have entities from both extractions merged
         assert len(result["entities"]) >= 2
+        # Verify single call was made
+        assert mock_client.chat_json.call_count == 1
 
     @patch("src.utils.api_client.llm_client")
     def test_dual_extract_merges_duplicates(self, mock_client):

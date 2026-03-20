@@ -1,5 +1,6 @@
 """Train intent classifier: fine-tune DistilBERT on text adventure actions."""
 import sys
+import json
 import argparse
 from pathlib import Path
 
@@ -10,6 +11,7 @@ from transformers import (
     AutoModelForSequenceClassification,
     TrainingArguments,
     Trainer,
+    EarlyStoppingCallback,
 )
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score
@@ -50,6 +52,37 @@ def compute_metrics(eval_pred):
     predictions, labels = eval_pred
     preds = predictions.argmax(axis=-1)
     return {"accuracy": accuracy_score(labels, preds)}
+
+
+def load_data_from_jsonl(filepath: str) -> tuple:
+    """Load training data from a JSONL file.
+
+    Each line: {"text": "...", "intent": "..."}
+    """
+    texts = []
+    labels = []
+    label2id = {label: i for i, label in enumerate(settings.INTENT_LABELS)}
+
+    with open(filepath, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            sample = json.loads(line)
+            text = sample.get("text", "")
+            intent = sample.get("intent", "other")
+            if text and intent in label2id:
+                texts.append(text)
+                labels.append(label2id[intent])
+
+    print(f"Loaded {len(texts)} samples from {filepath}")
+    # Print distribution
+    from collections import Counter
+    dist = Counter(labels)
+    for label_idx, count in sorted(dist.items()):
+        label_name = settings.INTENT_LABELS[label_idx]
+        print(f"  {label_name}: {count}")
+    return texts, labels
 
 
 def create_synthetic_training_data():
@@ -162,10 +195,15 @@ def train(args):
     # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     
-    # Prepare data
-    texts, labels = create_synthetic_training_data()
+    # Prepare data — load from JSONL or use synthetic
+    if args.data_path and Path(args.data_path).exists():
+        texts, labels = load_data_from_jsonl(args.data_path)
+    else:
+        texts, labels = create_synthetic_training_data()
+        print(f"Using synthetic data: {len(texts)} samples")
+
     train_texts, val_texts, train_labels, val_labels = train_test_split(
-        texts, labels, test_size=0.2, random_state=42, stratify=labels
+        texts, labels, test_size=0.15, random_state=42, stratify=labels
     )
     
     train_dataset = IntentDataset(train_texts, train_labels, tokenizer, max_length=args.max_length)
@@ -205,6 +243,7 @@ def train(args):
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
         compute_metrics=compute_metrics,
+        callbacks=[EarlyStoppingCallback(early_stopping_patience=3)],
     )
     
     # Train
@@ -224,7 +263,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train intent classifier")
     parser.add_argument("--output_dir", default="models/intent_classifier", help="Output directory")
     parser.add_argument("--model_name", default=settings.INTENT_MODEL_NAME, help="Base encoder model")
-    parser.add_argument("--epochs", type=int, default=6, help="Number of training epochs")
+    parser.add_argument("--data_path", default="", help="Path to JSONL training data")
+    parser.add_argument("--epochs", type=int, default=10, help="Number of training epochs")
     parser.add_argument("--batch_size", type=int, default=settings.INTENT_CPU_BATCH_SIZE, help="Batch size (CPU: 8 recommended)")
     parser.add_argument("--max_length", type=int, default=settings.INTENT_MAX_LENGTH, help="Tokenizer max length")
     parser.add_argument("--lr", type=float, default=2e-5, help="Learning rate")
