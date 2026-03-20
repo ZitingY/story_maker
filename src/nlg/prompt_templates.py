@@ -34,10 +34,12 @@ Recent history:
 {history}
 
 The player's intent is "{intent}".
+The player's emotional tone is: {emotion}
 The player says: "{player_input}"
 
 Continue the story in 2-4 vivid paragraphs, reacting to the player's action \
-and advancing the plot.
+and emotional tone. Adjust the narrative mood to match: a {emotion} tone should \
+influence pacing, word choice, and atmosphere. Advance the plot.
 """
 
 # ── Option generation ─────────────────────────────────────

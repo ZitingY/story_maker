@@ -45,6 +45,7 @@ class Settings(BaseSettings):
     KG_RELATION_TYPES: List[str] = [
         "located_at", "possesses", "ally_of", "enemy_of",
         "knows", "part_of", "caused_by", "has_attribute",
+        "causes", "prevents", "enables", "follows",
     ]
 
     # ── KG Strategy Config ────────────────────────────────
@@ -71,6 +72,11 @@ class Settings(BaseSettings):
     # ── Game Config ───────────────────────────────────────
     NARRATIVE_HISTORY_WINDOW: int = 6
     MAX_CONTEXT_TOKENS: int = 512
+
+    # ── KG Persistence ───────────────────────────────────
+    KG_SAVE_DIR: Path = PROJECT_ROOT / "saves"
+    KG_AUTO_SAVE: bool = True
+    KG_SNAPSHOT_INTERVAL: int = 5  # Save snapshot every N turns
 
     # ── Streamlit ─────────────────────────────────────────
     STREAMLIT_PORT: int = 7860

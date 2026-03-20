@@ -40,12 +40,14 @@ class ConflictDetector:
         """Return a list of conflict dicts (may be empty)."""
         conflicts: List[Dict[str, str]] = []
         conflicts.extend(self._rule_based_check())
+        conflicts.extend(self._temporal_check())
         if new_text:
             conflicts.extend(self._llm_check(new_text))
         logger.info(
-            "[ConflictDetector][check_all] Found %d conflicts (rule=%d, llm=%d)",
+            "[ConflictDetector][check_all] Found %d conflicts (rule=%d, temporal=%d, llm=%d)",
             len(conflicts),
-            len([c for c in conflicts if c.get("type") != "llm"]),
+            len([c for c in conflicts if c.get("type") not in ("llm", "temporal")]),
+            len([c for c in conflicts if c.get("type") == "temporal"]),
             len([c for c in conflicts if c.get("type") == "llm"]),
         )
         return conflicts
@@ -90,6 +92,81 @@ class ConflictDetector:
                             "relation": rel,
                             "description": f"{node} is dead but has relation '{rel}' → {tgt}.",
                         })
+        return conflicts
+
+    # ── layer 1b: temporal ────────────────────────────────
+    def _temporal_check(self) -> List[Dict[str, str]]:
+        """Check for temporal/causal inconsistencies.
+
+        Detects:
+        1. Dead entity actions after death: relations created after entity is marked dead
+        2. Causal inversion: B.created_turn < A.created_turn but A --[causes]--> B
+        """
+        conflicts: List[Dict[str, str]] = []
+        g = self.kg.graph
+
+        # 1. Check for dead entity actions after death
+        for node, ndata in g.nodes(data=True):
+            status = ndata.get("status", {})
+            if not isinstance(status, dict) or status.get("status") != "dead":
+                continue
+
+            # Find when entity died (look in status_history)
+            death_turn = None
+            for entry in reversed(ndata.get("status_history", [])):
+                changes = entry.get("changes", {})
+                if "status" in changes and "dead" in changes["status"]:
+                    death_turn = entry["turn"]
+                    break
+
+            if death_turn is None:
+                # Death was set directly in status, use last_mentioned_turn as proxy
+                death_turn = ndata.get("last_mentioned_turn", 999)
+
+            # Check for relations created after death
+            for _, tgt, edata in g.out_edges(node, data=True):
+                rel_turn = edata.get("created_turn", 0)
+                if rel_turn > death_turn:
+                    rel = edata.get("relation", "?")
+                    conflicts.append({
+                        "type": "temporal",
+                        "subtype": "dead_entity_action",
+                        "source": node,
+                        "target": tgt,
+                        "relation": rel,
+                        "death_turn": death_turn,
+                        "relation_turn": rel_turn,
+                        "description": (
+                            f"{node} (died turn {death_turn}) has relation "
+                            f"'{rel}' → {tgt} created at turn {rel_turn}."
+                        ),
+                    })
+
+        # 2. Check for causal inversion
+        for src, tgt, data in g.edges(data=True):
+            relation = data.get("relation", "")
+            if relation not in ("causes", "enables"):
+                continue
+            if not g.has_node(src) or not g.has_node(tgt):
+                continue
+
+            src_created = g.nodes[src].get("created_turn", 0)
+            tgt_created = g.nodes[tgt].get("created_turn", 0)
+
+            if tgt_created < src_created:
+                conflicts.append({
+                    "type": "temporal",
+                    "subtype": "causal_inversion",
+                    "source": src,
+                    "target": tgt,
+                    "relation": relation,
+                    "description": (
+                        f"Causal inversion: {src} (created turn {src_created}) "
+                        f"'{relation}' {tgt} (created turn {tgt_created}), "
+                        f"but {tgt} was created first."
+                    ),
+                })
+
         return conflicts
 
     # ── layer 2: LLM ─────────────────────────────────────

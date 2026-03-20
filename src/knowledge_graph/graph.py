@@ -48,6 +48,7 @@ class KnowledgeGraph:
         status: Optional[Dict[str, Any]] = None,
         turn_id: Optional[int] = None,
         is_player_mentioned: bool = False,
+        emotion: Optional[str] = None,
     ) -> str:
         """Upsert a node with rich attributes.  Returns the lowered key.
 
@@ -61,6 +62,14 @@ class KnowledgeGraph:
         key = self._key(name)
         turn = turn_id if turn_id is not None else self._current_turn
 
+        # Validate entity_type against KG_ENTITY_TYPES
+        if entity_type and entity_type != "unknown" and entity_type not in settings.KG_ENTITY_TYPES:
+            logger.warning(
+                "[KG][add_entity] Invalid entity_type '%s' for '%s', falling back to 'unknown'",
+                entity_type, key,
+            )
+            entity_type = "unknown"
+
         if self.graph.has_node(key):
             node = self.graph.nodes[key]
             # update description: append new info if different
@@ -68,11 +77,29 @@ class KnowledgeGraph:
                 old_desc = node.get("description", "")
                 node["description"] = f"{old_desc}. {description}".strip(". ")
 
-            # merge status dict
+            # merge status dict (with history tracking)
             if status:
+                # Snapshot old status BEFORE merge
+                old_status = dict(node.get("status", {}))
+
+                # Merge new status
                 existing_status = node.get("status", {})
                 existing_status.update(status)
                 node["status"] = existing_status
+
+                # Track changes
+                changes = {}
+                for k, v in status.items():
+                    old_val = old_status.get(k)
+                    if old_val is not None and old_val != v:
+                        changes[k] = f"{old_val}→{v}"
+                    elif old_val is None:
+                        changes[k] = f"(new) {v}"
+                if changes:
+                    history = node.get("status_history", [])
+                    history.append({"turn": turn, "changes": changes})
+                    # Keep only last 10 entries
+                    node["status_history"] = history[-10:]
 
             # update entity_type if provided
             if entity_type and entity_type != "unknown":
@@ -89,6 +116,10 @@ class KnowledgeGraph:
             if is_player_mentioned:
                 boost += settings.KG_IMPORTANCE_PLAYER_BOOST
             node["importance_score"] = min(1.0, node.get("importance_score", 0.5) + boost)
+
+            # update emotion
+            if emotion:
+                node["last_emotion"] = emotion
 
             logger.debug(
                 "[KG][add_entity] Updated '%s' type=%s turn=%d mentions=%d importance=%.2f | total_nodes=%d",
@@ -110,6 +141,8 @@ class KnowledgeGraph:
                 mention_count=1,
                 player_mention_count=1 if is_player_mentioned else 0,
                 importance_score=min(1.0, importance),
+                last_emotion=emotion or "",
+                status_history=[],
             )
             self._enforce_limit()
             logger.info(
@@ -129,6 +162,42 @@ class KnowledgeGraph:
         if key in self.graph:
             self.graph.remove_node(key)
             logger.debug("[KG][remove_entity] Removed '%s' | total_nodes=%d", key, self.num_nodes)
+
+    # ── temporal queries ──────────────────────────────────
+    def get_entity_history(self, name: str) -> List[Dict[str, Any]]:
+        """Return the status change history for an entity."""
+        key = self._key(name)
+        if key in self.graph:
+            return list(self.graph.nodes[key].get("status_history", []))
+        return []
+
+    def get_entity_status_at_turn(self, name: str, turn: int) -> Dict[str, Any]:
+        """Reconstruct an entity's status as of a specific turn."""
+        key = self._key(name)
+        if key not in self.graph:
+            return {}
+
+        node = self.graph.nodes[key]
+        created = node.get("created_turn", 0)
+        if turn < created:
+            return {}
+
+        # Start with current status and undo changes that happened after target turn
+        current_status = dict(node.get("status", {}))
+        history = node.get("status_history", [])
+
+        for entry in reversed(history):
+            if entry["turn"] <= turn:
+                continue  # This change was before/at target turn, keep it
+            # Undo this change (it happened after target turn)
+            for field, change_str in entry.get("changes", {}).items():
+                if "→" in change_str:
+                    old_val = change_str.split("→")[0]
+                    current_status[field] = old_val
+                elif "(new)" in change_str:
+                    current_status.pop(field, None)
+
+        return current_status
 
     # ── relation management ───────────────────────────────
     def add_relation(
@@ -458,6 +527,20 @@ class KnowledgeGraph:
             status_str = ", ".join(f"{k}: {v}" for k, v in status.items())
             lines.append(f"  Status: {{{status_str}}}")
 
+        emotion = data.get("last_emotion", "")
+        if emotion:
+            lines.append(f"  Emotion: {emotion}")
+
+        # Status history (last 3 entries)
+        history = data.get("status_history", [])
+        if history:
+            recent_history = history[-3:]
+            history_str = "; ".join(
+                f"turn {h['turn']}: {', '.join(f'{k}={v}' for k, v in h.get('changes', {}).items())}"
+                for h in recent_history
+            )
+            lines.append(f"  History: {history_str}")
+
         # outgoing relations
         out_rels = []
         if key in self.graph:
@@ -493,3 +576,113 @@ class KnowledgeGraph:
     @property
     def num_edges(self) -> int:
         return self.graph.number_of_edges()
+
+    # ── persistence ───────────────────────────────────────
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize the knowledge graph to a plain dict.
+
+        Returns a dict with keys: version, turn, nodes, edges.
+        All non-basic types are converted to JSON-safe values.
+        """
+        nodes = []
+        for key, data in self.graph.nodes(data=True):
+            node = {"key": key}
+            for k, v in data.items():
+                # Ensure all values are JSON-serializable
+                if isinstance(v, (str, int, float, bool, type(None))):
+                    node[k] = v
+                elif isinstance(v, dict):
+                    node[k] = v
+                elif isinstance(v, list):
+                    node[k] = v
+                else:
+                    node[k] = str(v)
+            nodes.append(node)
+
+        edges = []
+        for src, tgt, key, data in self.graph.edges(data=True, keys=True):
+            edge = {"source": src, "target": tgt, "key": key}
+            for k, v in data.items():
+                if isinstance(v, (str, int, float, bool, type(None))):
+                    edge[k] = v
+                elif isinstance(v, dict):
+                    edge[k] = v
+                elif isinstance(v, list):
+                    edge[k] = v
+                else:
+                    edge[k] = str(v)
+            edges.append(edge)
+
+        return {
+            "version": 1,
+            "turn": self._current_turn,
+            "nodes": nodes,
+            "edges": edges,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "KnowledgeGraph":
+        """Deserialize a knowledge graph from a plain dict.
+
+        Accepts the format produced by ``to_dict()``.
+        """
+        kg = cls()
+        kg._current_turn = data.get("turn", 0)
+
+        # Rebuild nodes
+        for node_data in data.get("nodes", []):
+            key = node_data.pop("key", "")
+            if key:
+                kg.graph.add_node(key, **node_data)
+
+        # Rebuild edges
+        for edge_data in data.get("edges", []):
+            src = edge_data.pop("source", "")
+            tgt = edge_data.pop("target", "")
+            edge_key = edge_data.pop("key", 0)
+            if src and tgt:
+                kg.graph.add_edge(src, tgt, key=edge_key, **edge_data)
+
+        return kg
+
+    def save(self, filepath: str) -> None:
+        """Save the knowledge graph to a JSON file."""
+        import json
+        from pathlib import Path
+
+        path = Path(filepath)
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        data = self.to_dict()
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+
+        logger.info(
+            "[KG][save] Saved to %s | %d nodes, %d edges, turn=%d",
+            path, len(data["nodes"]), len(data["edges"]), data["turn"],
+        )
+
+    @classmethod
+    def load(cls, filepath: str) -> "KnowledgeGraph":
+        """Load a knowledge graph from a JSON file."""
+        import json
+        from pathlib import Path
+
+        path = Path(filepath)
+        if not path.exists():
+            logger.warning("[KG][load] File not found: %s, returning empty graph", path)
+            return cls()
+
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        version = data.get("version", 0)
+        if version != 1:
+            logger.warning("[KG][load] Unknown version %d, attempting to load anyway", version)
+
+        kg = cls.from_dict(data)
+        logger.info(
+            "[KG][load] Loaded from %s | %d nodes, %d edges, turn=%d",
+            path, kg.num_nodes, kg.num_edges, kg._current_turn,
+        )
+        return kg
